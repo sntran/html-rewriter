@@ -1,11 +1,58 @@
-import { HTMLRewriter as BaseHTMLRewriter } from "html-rewriter-wasm";
+import { HTMLRewriter as BaseHTMLRewriter } from "lol-html";
 
 /**
- * @typedef {import("html-rewriter-wasm").DocumentHandlers} DocumentHandlers
+ * @typedef {import("lol-html").Doctype} Doctype
  */
 
 /**
- * @typedef {import("html-rewriter-wasm").ElementHandlers} ElementHandlers
+ * @typedef {import("lol-html").Element} Element
+ */
+
+/**
+ * @typedef {import("lol-html").Comment} Comment
+ */
+
+/**
+ * @typedef {import("lol-html").TextChunk} TextChunk
+ */
+
+/**
+ * @callback doctype
+ * @param   {Doctype} doctype
+ * @returns {void | Promise<void>}
+ */
+
+/**
+ * @callback element
+ * @param   {Element} element
+ * @returns {void | Promise<void>}
+ */
+
+/**
+ * @callback comments
+ * @param   {comment} comment
+ * @returns {void | Promise<void>}
+ */
+
+/**
+ * @callback text
+ * @param   {TextChunk} text
+ * @returns {void | Promise<void>}
+ */
+
+/**
+ * @typedef  {Object} DocumentHandlers
+ * @property {doctype} [doctype]
+ * @property {element} [element]
+ * @property {comments} [comments]
+ * @property {text} [text]
+ */
+
+/**
+ * @typedef  {Object} ElementHandlers
+ * @property {element} [element]
+ * @property {comments} [comments]
+ * @property {text} [text]
  */
 
 /**
@@ -41,7 +88,7 @@ export class HTMLRewriter {
 
   /**
    * Attaches a handler to the document
-   * @param {DocumentHandlers} handlers
+   * @param   {DocumentHandlers} handlers
    * @returns {this}
    */
   onDocument(handlers) {
@@ -51,8 +98,8 @@ export class HTMLRewriter {
 
   /**
    * Attaches a handler to an element matching the selector
-   * @param {string} selector CSS selector to match on
-   * @param {ElementHandlers} handlers
+   * @param   {string} selector CSS selector to match on
+   * @param   {ElementHandlers} handlers
    * @returns {this}
    */
   on(selector, handlers) {
@@ -62,7 +109,7 @@ export class HTMLRewriter {
 
   /**
    * Transforms the response body using the attached handlers
-   * @param {Response} response
+   * @param   {Response} response
    * @returns {Response}
    */
   transform(response) {
@@ -80,7 +127,7 @@ export class HTMLRewriter {
 
     const { readable, writable } = new TransformStream({
       start(controller) {
-        rewriter = new BaseHTMLRewriter((chunk) => {
+        rewriter = new BaseHTMLRewriter("utf8", (chunk) => {
           if (chunk.length !== 0) {
             controller.enqueue(chunk);
           }
