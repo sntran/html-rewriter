@@ -25,7 +25,7 @@
     }
   },
   "scripts": {
-    "test": "node --experimental-wasm-jspi --test"
+    "test": "node --experimental-wasm-jspi --experimental-test-coverage --test"
   },
   "files": [
     "mod.js",

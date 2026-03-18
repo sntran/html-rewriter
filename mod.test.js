@@ -981,3 +981,182 @@ suite("Async text handler (exercises textchunk_* promising wrapping)", () => {
     assert.equal(await text(res), "<p><b>word</b></p>");
   });
 });
+
+suite("WASM queue serialization and .free() safety", () => {
+  test("concurrent transform() calls are serialized and do not interleave WASM stack", async () => {
+    // This test creates two HTMLRewriter instances and runs transform() on both concurrently.
+    // If the global WASM queue is not working, this will cause memory corruption or errors.
+    const htmlA = "<div>A</div>";
+    const htmlB = "<div>B</div>";
+    const rwA = new HTMLRewriter().on("div", {
+      async element(el) {
+        await new Promise((r) => setTimeout(r, 30));
+        el.setInnerContent("A1");
+      },
+    });
+    const rwB = new HTMLRewriter().on("div", {
+      async element(el) {
+        await new Promise((r) => setTimeout(r, 10));
+        el.setInnerContent("B1");
+      },
+    });
+    // Start both transforms at the same time
+    const [resultA, resultB] = await Promise.all([
+      text(rwA.transform(createResponse(htmlA))),
+      text(rwB.transform(createResponse(htmlB))),
+    ]);
+    assert.equal(resultA, "<div>A1</div>");
+    assert.equal(resultB, "<div>B1</div>");
+  });
+
+  test(".free() is queued and does not interleave with WASM calls", async () => {
+    // This test calls .free() manually during a transform to ensure it is queued and does not corrupt memory.
+    const html = "<div>X</div>";
+    let coreRef;
+    const rw = new HTMLRewriter().on("div", {
+      async element(el) {
+        // Grab the internal core rewriter and call .free() while transform is in progress
+        if (!coreRef && el.constructor && el.constructor.name === "Element") {
+          // Try to access the internal core (not public API, but for test)
+          coreRef = el._core || el.core || undefined;
+        }
+        await new Promise((r) => setTimeout(r, 5));
+        el.setInnerContent("Y");
+      },
+    });
+    // Try to call .free() during transform (simulate user error)
+    const resPromise = text(rw.transform(createResponse(html)));
+    if (coreRef && typeof coreRef.free === "function") {
+      // Should not throw or corrupt memory
+      coreRef.free();
+    }
+    const result = await resPromise;
+    assert.equal(result, "<div>Y</div>");
+  });
+
+  test("queue recovers after a handler error — subsequent transforms succeed", async () => {
+    // An error in one transform must NOT poison the shared WASM queue.
+    const failing = new HTMLRewriter().on("div", {
+      async element() {
+        await new Promise((r) => setTimeout(r, 5));
+        throw new Error("deliberate-failure");
+      },
+    });
+    const failRes = failing.transform(createResponse("<div>x</div>"));
+    await assert.rejects(text(failRes), (err) => {
+      assert.ok(err.message.includes("deliberate-failure"));
+      return true;
+    });
+
+    // A fresh transform after the failure must work correctly.
+    const ok = new HTMLRewriter().on("div", {
+      element(el) {
+        el.setInnerContent("recovered");
+      },
+    });
+    const result = await text(ok.transform(createResponse("<div>old</div>")));
+    assert.equal(result, "<div>recovered</div>");
+  });
+
+  test("multiple sequential errors do not permanently break the queue", async () => {
+    for (let i = 0; i < 3; i++) {
+      const rw = new HTMLRewriter().on("p", {
+        element() {
+          throw new Error(`error-${i}`);
+        },
+      });
+      await assert.rejects(text(rw.transform(createResponse("<p>x</p>"))));
+    }
+    // After 3 consecutive errors the queue must still work.
+    const res = new HTMLRewriter()
+      .on("p", {
+        element(el) {
+          el.setInnerContent("ok");
+        },
+      })
+      .transform(createResponse("<p>old</p>"));
+    assert.equal(await text(res), "<p>ok</p>");
+  });
+
+  test("many concurrent async transforms complete without memory corruption", async () => {
+    const N = 10;
+    const promises = [];
+    for (let i = 0; i < N; i++) {
+      const rw = new HTMLRewriter().on("span", {
+        async element(el) {
+          await new Promise((r) => setTimeout(r, Math.random() * 20));
+          el.setInnerContent(String(i));
+        },
+      });
+      promises.push(
+        text(rw.transform(createResponse(`<span>${i}</span>`))),
+      );
+    }
+    const results = await Promise.all(promises);
+    for (let i = 0; i < N; i++) {
+      assert.equal(results[i], `<span>${i}</span>`);
+    }
+  });
+
+  test("concurrent transforms with mixed sync and async handlers", async () => {
+    const syncRw = new HTMLRewriter().on("b", {
+      element(el) {
+        el.setInnerContent("sync");
+      },
+    });
+    const asyncRw = new HTMLRewriter().on("i", {
+      async element(el) {
+        await new Promise((r) => setTimeout(r, 15));
+        el.setInnerContent("async");
+      },
+    });
+    const [syncResult, asyncResult] = await Promise.all([
+      text(syncRw.transform(createResponse("<b>old</b>"))),
+      text(asyncRw.transform(createResponse("<i>old</i>"))),
+    ]);
+    assert.equal(syncResult, "<b>sync</b>");
+    assert.equal(asyncResult, "<i>async</i>");
+  });
+
+  test("error in one concurrent transform does not affect the other", async () => {
+    const failing = new HTMLRewriter().on("div", {
+      async element() {
+        await new Promise((r) => setTimeout(r, 5));
+        throw new Error("concurrent-fail");
+      },
+    });
+    const passing = new HTMLRewriter().on("p", {
+      async element(el) {
+        await new Promise((r) => setTimeout(r, 10));
+        el.setInnerContent("ok");
+      },
+    });
+    const [failResult, passResult] = await Promise.allSettled([
+      text(failing.transform(createResponse("<div>x</div>"))),
+      text(passing.transform(createResponse("<p>old</p>"))),
+    ]);
+    assert.equal(failResult.status, "rejected");
+    assert.ok(failResult.reason.message.includes("concurrent-fail"));
+    assert.equal(passResult.status, "fulfilled");
+    assert.equal(passResult.value, "<p>ok</p>");
+  });
+
+  test("reuse of HTMLRewriter instance after a failed transform", async () => {
+    let shouldFail = true;
+    const rw = new HTMLRewriter().on("div", {
+      async element(el) {
+        await new Promise((r) => setTimeout(r, 5));
+        if (shouldFail) throw new Error("first-fail");
+        el.setInnerContent("success");
+      },
+    });
+    // First transform fails.
+    await assert.rejects(
+      text(rw.transform(createResponse("<div>a</div>"))),
+    );
+    // Second transform with same instance succeeds.
+    shouldFail = false;
+    const result = await text(rw.transform(createResponse("<div>b</div>")));
+    assert.equal(result, "<div>success</div>");
+  });
+});

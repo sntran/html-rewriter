@@ -191,32 +191,65 @@ if (hasJSPI) {
   }
 
   // ---------------------------------------------------------------------------
-  // Patch CoreRewriter write() / end() to be async-aware.
+  // Patch CoreRewriter write() / end() / free() to be async-aware and
+  // serialized across all instances.
   // ---------------------------------------------------------------------------
   // The glue code's write() / end() methods call the WASM exports synchronously
   // and drop the return value.  With our promising-wrapper, the WASM export
   // returns a Promise that gets captured in `_pendingPromise`.  We override the
   // prototype methods to await that Promise after the original call returns.
+  //
+  // Because all CoreRewriter instances share the same WASM linear memory, we
+  // must serialize every WASM entry point (write / end / free) through a global
+  // promise queue.  Without this, two concurrent `#pump` loops (e.g. chained
+  // `transform()` calls) can interleave WASM stack operations via JSPI,
+  // corrupting the allocator and causing "memory access out of bounds".
 
   const _origWrite = CoreRewriter.prototype.write;
   const _origEnd = CoreRewriter.prototype.end;
+  const _origFree = CoreRewriter.prototype.free;
+
+  /** Global promise queue — ensures only one WASM call is in-flight at a time. */
+  let _wasmQueue = Promise.resolve();
 
   CoreRewriter.prototype.write = async function asyncWrite(chunk) {
-    _pendingPromise = null;
-    _origWrite.call(this, chunk);
-    if (_pendingPromise) {
-      await _pendingPromise;
+    // Create the task promise that the caller will await (preserves errors).
+    const task = _wasmQueue.then(async () => {
       _pendingPromise = null;
-    }
+      _origWrite.call(this, chunk);
+      if (_pendingPromise) {
+        await _pendingPromise;
+        _pendingPromise = null;
+      }
+    });
+    // Advance the queue regardless of success/failure so subsequent
+    // operations are not poisoned by a prior rejection.
+    _wasmQueue = task.catch(() => {});
+    // Caller sees the original error (if any).
+    await task;
   };
 
   CoreRewriter.prototype.end = async function asyncEnd() {
-    _pendingPromise = null;
-    _origEnd.call(this);
-    if (_pendingPromise) {
-      await _pendingPromise;
+    const task = _wasmQueue.then(async () => {
       _pendingPromise = null;
-    }
+      _origEnd.call(this);
+      if (_pendingPromise) {
+        await _pendingPromise;
+        _pendingPromise = null;
+      }
+    });
+    _wasmQueue = task.catch(() => {});
+    await task;
+  };
+
+  CoreRewriter.prototype.free = function queuedFree() {
+    // Queue the free so it never runs while another instance is mid-WASM-call.
+    // Callers (e.g. #pump's finally block) do not await this — that is fine
+    // because the queue guarantees ordering and the free cannot fail in a way
+    // that matters to the caller (errors are already swallowed).
+    _wasmQueue = _wasmQueue.then(() => {
+      _origFree.call(this);
+    }).catch(() => {});
   };
 } else {
   // ---------------------------------------------------------------------------
