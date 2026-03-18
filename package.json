@@ -1,6 +1,6 @@
 {
   "name": "@sntran/html-rewriter",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "HTMLRewriter for all platforms.",
   "author": "Trần Nguyễn Sơn",
   "homepage": "https://github.com/sntran/HTMLRewriter#readme",
@@ -25,7 +25,7 @@
     }
   },
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "node --experimental-wasm-jspi --test"
   },
   "files": [
     "mod.js",
@@ -33,6 +33,6 @@
     "workerd.js"
   ],
   "dependencies": {
-    "html-rewriter-wasm": "^0.4.1"
+    "@sntran/lol-html": "^2.7.1"
   }
 }
