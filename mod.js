@@ -353,6 +353,33 @@ if (hasJSPI) {
  * rewriter.transform(await fetch("https://example.com"));
  * ```
  */
+/**
+ * Writes the chunks of the output as one chunk, and empties the list.
+ *
+ * A stream with a long queue of small chunks is slow to read in Node.js:
+ * each read moves all the other chunks of the queue. Also, the wait for the
+ * write stops the read of the input until the reader takes the output, as
+ * the HTMLRewriter of Cloudflare Workers does.
+ * @param {WritableStreamDefaultWriter} writer
+ * @param {Uint8Array[]} output
+ */
+async function flush(writer, output) {
+  if (output.length === 0) return;
+  let chunk = output[0];
+  if (output.length > 1) {
+    let size = 0;
+    for (const part of output) size += part.length;
+    chunk = new Uint8Array(size);
+    let offset = 0;
+    for (const part of output) {
+      chunk.set(part, offset);
+      offset += part.length;
+    }
+  }
+  output.length = 0;
+  await writer.write(chunk);
+}
+
 export class HTMLRewriter {
   /** @type {Array<{selector: string, handlers: ElementHandlers}>} */
   #elementHandlers = [];
@@ -418,11 +445,19 @@ export class HTMLRewriter {
     const writer = writable.getWriter();
 
     /**
+     * The chunks of the output of the current `write()` or `end()` of the
+     * engine. The engine gives many small chunks, and `#pump` writes them as
+     * one chunk.
+     * @type {Uint8Array[]}
+     */
+    const output = [];
+
+    /**
      * @type {import('@sntran/lol-html').HTMLRewriter}
      */
     const core = new CoreRewriter("utf8", (chunk) => {
       if (chunk.length !== 0) {
-        writer.write(chunk);
+        output.push(chunk);
       }
     });
 
@@ -433,7 +468,7 @@ export class HTMLRewriter {
       core.onDocument(handlers);
     }
 
-    this.#pump(response.body, core, writer);
+    this.#pump(response.body, core, writer, output);
 
     return new Response(readable, {
       status: response.status,
@@ -446,8 +481,9 @@ export class HTMLRewriter {
    * @param {ReadableStream | null} body
    * @param {import('@sntran/lol-html').HTMLRewriter} core
    * @param {WritableStreamDefaultWriter} writer
+   * @param {Uint8Array[]} output The chunks of the engine to write.
    */
-  async #pump(body, core, writer) {
+  async #pump(body, core, writer, output) {
     try {
       if (body) {
         const reader = body.getReader();
@@ -455,9 +491,11 @@ export class HTMLRewriter {
           const { done, value } = await reader.read();
           if (done) break;
           await core.write(value);
+          await flush(writer, output);
         }
       }
       await core.end();
+      await flush(writer, output);
       writer.close();
     } catch (err) {
       writer.abort(err);
