@@ -1160,3 +1160,51 @@ suite("WASM queue serialization and .free() safety", () => {
     assert.equal(result, "<div>success</div>");
   });
 });
+suite("Output chunks and back pressure", () => {
+  test("gives one chunk of output for each chunk of input", async () => {
+    const items = Array.from({ length: 2000 }, (_, i) => `<li>${i}</li>`)
+      .join("");
+    const html = `<ul>${items}</ul>`;
+    const res = new HTMLRewriter()
+      .on("li", { element() {} })
+      .transform(createResponse(html, 4096));
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let result = "";
+    let chunks = 0;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks++;
+      result += decoder.decode(value, { stream: true });
+    }
+    assert.equal(result, html);
+    // One chunk for each chunk of 4096 bytes of input, and one for the end.
+    assert.ok(chunks <= Math.ceil(html.length / 4096) + 1, `${chunks}`);
+  });
+
+  test("reads the input only when the reader takes the output", async () => {
+    const encoder = new TextEncoder();
+    const total = 100;
+    let pulls = 0;
+    const input = new ReadableStream({
+      pull(controller) {
+        if (pulls === total) {
+          controller.close();
+          return;
+        }
+        pulls++;
+        controller.enqueue(encoder.encode(`<p>${pulls}</p>`));
+      },
+    }, { highWaterMark: 0 });
+    const res = new HTMLRewriter()
+      .on("p", { element() {} })
+      .transform(new Response(input));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    // With no reader, only a few chunks of input go in.
+    assert.ok(pulls < 10, `${pulls}`);
+    const result = await text(res);
+    assert.equal(pulls, total);
+    assert.ok(result.endsWith(`<p>${total}</p>`));
+  });
+});
